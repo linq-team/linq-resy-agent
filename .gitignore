@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+*.log
+*.pem
+*.key
+credentials.json
+token.json
+.DS_Store
+CLAUDE.md
+.claude/
+.codex/
+
+# OpenAPI spec (get latest from https://apidocs.linqapp.com)
+linqV3api.yaml
