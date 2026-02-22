@@ -94,7 +94,11 @@ src/
 
 **Dev mode** — Set `RESY_AUTH_TOKEN` in `.env` and all users share your Resy account. No onboarding needed.
 
-**Multi-tenant** — Remove `RESY_AUTH_TOKEN` from `.env`. Each user gets a magic link to paste their own Resy JWT. Credentials are encrypted (AES-256-GCM) and stored per-user.
+**SMS OTP (default)** — Users verify via Resy's native SMS OTP flow. Text the bot → receive a code → verify with your account email → connected. No manual token copying needed.
+
+**Inline JWT** — Power users can paste their `x-resy-auth-token` directly (starts with `eyJ...`). Useful when SMS is rate-limited.
+
+All credentials are encrypted (AES-256-GCM) and stored per-user.
 
 ## Resy Tools
 
@@ -105,6 +109,8 @@ src/
 | `resy_book` | Book a reservation using a config token |
 | `resy_cancel` | Cancel a reservation using a resy token |
 | `resy_reservations` | List upcoming reservations |
+| `resy_profile` | Get user's Resy profile (name, email, member info) |
+| `resy_sign_out` | Disconnect Resy account and clear credentials |
 
 ## Deployment
 
