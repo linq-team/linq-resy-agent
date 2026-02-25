@@ -5,8 +5,10 @@ import { createWebhookHandler } from './webhook/handler.js';
 import { sendMessage, markAsRead, startTyping, sendReaction, shareContactCard, getChat, renameGroupChat } from './linq/client.js';
 import { chat, getGroupChatAction, getTextForEffect } from './claude/client.js';
 import { getUserProfile, addMessage } from './state/conversation.js';
-import { authRoutes, getUser, createUser, loadUserContext, generateMagicLink, buildOnboardingMessage, consumeJustOnboarded } from './auth/index.js';
+import { authRoutes, getUser, createUser, loadUserContext, consumeJustOnboarded, setPendingOTP, getPendingOTP, clearPendingOTP, setPendingChallenge, getPendingChallenge, clearPendingChallenge, setCredentials, clearSignedOut } from './auth/index.js';
+import { sendResyOTP, verifyResyOTP, completeResyChallenge } from './bookings/index.js';
 import { redactPhone } from './utils/redact.js';
+import { putItem } from './db/dynamodb.js';
 
 // Clean up LLM response formatting quirks before sending
 function cleanResponse(text: string): string {
@@ -26,9 +28,18 @@ function cleanResponse(text: string): string {
     .trim();
 }
 
-// Track message count per chat for contact card sharing
-const chatMessageCount = new Map<string, number>();
+// Track message count per chat for contact card sharing (DynamoDB-backed)
 const CONTACT_CARD_INTERVAL = 5; // Share every N messages
+
+async function getChatMessageCount(chatId: string): Promise<number> {
+  const { getItem } = await import('./db/dynamodb.js');
+  const record = await getItem<{ count: number }>(`CHATCOUNT#${chatId}`, 'CHATCOUNT');
+  return record?.count ?? 0;
+}
+
+async function setChatMessageCount(chatId: string, count: number): Promise<void> {
+  await putItem(`CHATCOUNT#${chatId}`, 'CHATCOUNT', { count }, 7 * 24 * 60 * 60); // 7 day TTL
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -79,8 +90,9 @@ app.post(
     console.log(`[main] Processing message from ${redactPhone(from)}`);
 
     // Track message count for this chat
-    const count = (chatMessageCount.get(chatId) || 0) + 1;
-    chatMessageCount.set(chatId, count);
+    const prevCount = await getChatMessageCount(chatId);
+    const count = prevCount + 1;
+    await setChatMessageCount(chatId, count);
 
     // Share contact card on first message or every N messages
     const shouldShareContact = count === 1 || count % CONTACT_CARD_INTERVAL === 0;
@@ -101,29 +113,154 @@ app.post(
     const isGroupChat = chatInfo.handles.length > 2;
     const participantNames = chatInfo.handles.map(h => h.handle);
 
+    // ── Inline JWT auth: user texts their Resy token directly ─────────────
+    const trimmedText = text.trim();
+    if (trimmedText.startsWith('eyJ') && trimmedText.length > 100) {
+      console.log(`[main] User ${redactPhone(from)} sent a JWT token directly`);
+      if (!(await getUser(from))) await createUser(from);
+      await setCredentials(from, { resyAuthToken: trimmedText });
+      await clearSignedOut(from);
+      await clearPendingOTP(from);
+      await sendMessage(chatId, `you're all set! your resy account is connected`);
+      await new Promise(resolve => setTimeout(resolve, 800));
+      await sendMessage(chatId, `i can search restaurants, find open tables, make reservations, and manage your bookings — just text me what you need`);
+      console.log(`[main] JWT stored for ${redactPhone(from)}`);
+      return;
+    }
+
+    // ── Email challenge: user needs to verify email after OTP code ────────
+    const pendingChallenge = await getPendingChallenge(from);
+    if (pendingChallenge) {
+      const emailInput = text.trim().toLowerCase();
+      // Basic email validation
+      if (emailInput.includes('@') && emailInput.includes('.')) {
+        console.log(`[main] User ${redactPhone(from)} sent email for challenge verification`);
+
+        // Build field values from the challenge's required fields
+        const fieldValues: Record<string, string> = {};
+        for (const field of pendingChallenge.requiredFields) {
+          if (field.type === 'email' || field.name === 'em_address') {
+            fieldValues[field.name] = emailInput;
+          }
+        }
+
+        const authToken = await completeResyChallenge(
+          {
+            claimToken: pendingChallenge.claimToken,
+            challengeId: pendingChallenge.challengeId,
+            mobileNumber: pendingChallenge.mobileNumber,
+            firstName: pendingChallenge.firstName,
+            requiredFields: pendingChallenge.requiredFields,
+          },
+          fieldValues,
+        );
+
+        if (authToken) {
+          if (!(await getUser(from))) await createUser(from);
+          await setCredentials(from, { resyAuthToken: authToken });
+          await clearPendingChallenge(from);
+          await clearSignedOut(from);
+
+          await sendMessage(chatId, `you're all set! your resy account is connected`);
+          await new Promise(resolve => setTimeout(resolve, 800));
+          await sendMessage(chatId, `i can search restaurants, find open tables, make reservations, and manage your bookings — just text me what you need`);
+          console.log(`[main] Challenge completed — credentials stored for ${redactPhone(from)}`);
+          return;
+        } else {
+          await sendMessage(chatId, `that email didn't match your resy account — try the email address you used to sign up for resy`);
+          console.log(`[main] Challenge verification failed for ${redactPhone(from)}`);
+          return;
+        }
+      }
+      // Non-email text while challenge is pending
+      await sendMessage(chatId, `i need the email address on your resy account to finish connecting — what email did you use to sign up for resy?`);
+      return;
+    }
+
+    // ── OTP code check: if user is mid-onboarding and sends a code ────────
+    const pendingOtp = await getPendingOTP(from);
+    if (pendingOtp) {
+      // Strip dashes, spaces, dots from input (users may type "322-311" or "322 311")
+      const stripped = text.trim().replace(/[\s\-\.]/g, '');
+      // Accept 4-6 digit codes
+      if (/^\d{4,6}$/.test(stripped)) {
+        console.log(`[main] User ${redactPhone(from)} sent OTP code, verifying...`);
+        const result = await verifyResyOTP(from, stripped);
+
+        if (!result) {
+          await sendMessage(chatId, `that code didn't work — check the text from resy and try again`);
+          console.log(`[main] OTP verification failed for ${redactPhone(from)}`);
+          return;
+        }
+
+        if ('token' in result) {
+          // Direct token — rare but possible
+          if (!(await getUser(from))) await createUser(from);
+          await setCredentials(from, { resyAuthToken: result.token });
+          await clearPendingOTP(from);
+          await clearSignedOut(from);
+
+          await sendMessage(chatId, `you're all set! your resy account is connected`);
+          await new Promise(resolve => setTimeout(resolve, 800));
+          await sendMessage(chatId, `i can search restaurants, find open tables, make reservations, and manage your bookings — just text me what you need`);
+          console.log(`[main] OTP verified (direct token) — credentials stored for ${redactPhone(from)}`);
+          return;
+        }
+
+        // Challenge — need email verification
+        const challenge = result.challenge;
+        await clearPendingOTP(from);
+        await setPendingChallenge(from, {
+          chatId,
+          claimToken: challenge.claimToken,
+          challengeId: challenge.challengeId,
+          mobileNumber: challenge.mobileNumber,
+          firstName: challenge.firstName,
+          requiredFields: challenge.requiredFields,
+        });
+
+        const name = challenge.firstName ? ` ${challenge.firstName}` : '';
+        await sendMessage(chatId, `got it${name}! one more step — what's the email address on your resy account?`);
+        console.log(`[main] OTP accepted, challenge pending (needs email) for ${redactPhone(from)}`);
+        return;
+      }
+      // User sent non-code text while OTP is pending — remind them
+      await sendMessage(chatId, `i'm still waiting for your resy verification code — check your texts for a 6-digit code from resy`);
+      return;
+    }
+
     // ── Auth check: ensure user has Bookings credentials ──────────────────
-    const userCtx = loadUserContext(from);
+    const userCtx = await loadUserContext(from);
     if (!userCtx) {
-      // New user or incomplete onboarding — send magic link
-      if (!getUser(from)) {
-        createUser(from);
+      // New user or incomplete onboarding — send Resy SMS OTP
+      if (!(await getUser(from))) {
+        await createUser(from);
         console.log(`[main] New user: ${redactPhone(from)}`);
       } else {
         console.log(`[main] User ${redactPhone(from)} exists but no credentials`);
       }
 
-      const magicLink = generateMagicLink(from, chatId);
-      const onboardingText = buildOnboardingMessage(magicLink);
-
-      // Split on --- and send as multiple messages (same pattern as normal responses)
-      const parts = onboardingText.split('---').map(m => m.trim()).filter(m => m.length > 0);
-      for (let i = 0; i < parts.length; i++) {
-        await sendMessage(chatId, parts[i]);
-        if (i < parts.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 500));
-        }
+      // Send SMS OTP
+      const otpResult = await sendResyOTP(from);
+      if (otpResult === 'sms') {
+        await setPendingOTP(from, chatId);
+        await sendMessage(chatId, `hey! i just sent a verification code to this number from resy`);
+        await new Promise(resolve => setTimeout(resolve, 600));
+        await sendMessage(chatId, `send me the 6-digit code to connect your account`);
+        console.log(`[main] Sent Resy OTP to ${redactPhone(from)}`);
+      } else if (otpResult === 'rate_limited') {
+        // SMS rate limited — tell the user honestly and offer JWT fallback
+        await sendMessage(chatId, `resy is temporarily blocking verification texts to your number (too many recent attempts)`);
+        await new Promise(resolve => setTimeout(resolve, 600));
+        await sendMessage(chatId, `you can connect by pasting your resy auth token directly — go to resy.com, open browser dev tools, and copy the x-resy-auth-token header value, then text it to me`);
+        console.log(`[main] SMS rate limited for ${redactPhone(from)}, offered JWT fallback`);
+      } else {
+        // OTP failed entirely — phone might not be on Resy
+        await sendMessage(chatId, `i couldn't send a verification code to this number — make sure you have a resy account linked to this phone number`);
+        await new Promise(resolve => setTimeout(resolve, 600));
+        await sendMessage(chatId, `alternatively, you can paste your resy auth token directly — go to resy.com, log in, open dev tools, and copy the x-resy-auth-token header from any api request`);
+        console.log(`[main] OTP send failed for ${redactPhone(from)}`);
       }
-      console.log(`[main] Sent onboarding magic link to ${redactPhone(from)}`);
       return;
     }
 
@@ -159,7 +296,7 @@ app.post(
     }
 
     // Check if user just completed onboarding (one-shot flag)
-    const justOnboarded = consumeJustOnboarded(from);
+    const justOnboarded = await consumeJustOnboarded(from);
     if (justOnboarded) {
       console.log(`[main] User ${redactPhone(from)} just completed onboarding — injecting context`);
     }
@@ -248,16 +385,17 @@ app.post(
   })
 );
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`
+// Only start Express server when NOT running inside Lambda
+if (!process.env.AWS_LAMBDA_FUNCTION_NAME) {
+  app.listen(PORT, () => {
+    console.log(`
 ╔═══════════════════════════════════════════════════════╗
 ║              Linq Bookings Agent                      ║
 ╠═══════════════════════════════════════════════════════╣
 ║  Server running on http://localhost:${PORT}              ║
 ║                                                       ║
 ║  Endpoints:                                           ║
-║    POST /webhook       - Linq Blue webhook receiver   ║
+║    POST /linq-webhook  - Linq Blue webhook receiver   ║
 ║    GET  /health        - Health check                 ║
 ║    GET  /auth/setup    - Onboarding page              ║
 ║                                                       ║
@@ -266,5 +404,9 @@ app.listen(PORT, () => {
 ║    2. Configure webhook URL in Linq Blue              ║
 ║    3. Text your Linq Blue number!                     ║
 ╚═══════════════════════════════════════════════════════╝
-  `);
-});
+    `);
+  });
+}
+
+// Export for Lambda handler usage
+export { app };

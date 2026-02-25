@@ -1,7 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { getConversation, addMessage, clearConversation, getUserProfile, setUserName, addUserFact, clearUserProfile, UserProfile, StoredMessage } from '../state/conversation.js';
-import { searchRestaurants, findSlots, bookReservation, getReservations, cancelReservation } from '../bookings/index.js';
+import { searchRestaurants, findSlots, bookReservation, getReservations, cancelReservation, getResyProfile } from '../bookings/index.js';
 import type { BookingsCredentials } from '../auth/types.js';
+import { clearCredentials, clearSignedOut as clearSignedOutFlag } from '../auth/index.js';
 
 const client = new Anthropic();
 
@@ -9,18 +10,32 @@ const SYSTEM_PROMPT = `You are a helpful AI reservation assistant accessible via
 
 Built on the Linq messaging platform (linqapp.com), which bridges iMessage and RCS to your backend.
 
+## Authentication — CRITICAL
+Authentication is handled ENTIRELY by the system BEFORE your messages reach Claude. You will NEVER see messages from unauthenticated users — the system intercepts them and handles the SMS OTP flow automatically.
+
+IMPORTANT RULES:
+- NEVER tell users to "authenticate through resy" or "go to resy.com to connect" — that is NOT how this works
+- NEVER write "[signed you out]" or pretend to perform actions — you MUST use the actual tools
+- If a user asks to sign out or disconnect their Resy account, you MUST call the resy_sign_out tool. Do NOT fake it with text.
+- If a user asks about connecting or signing in, tell them: "just text me and the system will send you a verification code automatically"
+- You do NOT handle auth. The system does. Your job starts AFTER the user is authenticated.
+
 ## What You Do
 - Search for restaurants on Resy
 - Check available time slots for specific dates and party sizes
 - Book reservations directly through Resy
 - View and cancel upcoming reservations
+- Look up the user's Resy profile (name, email, etc.) using resy_profile
+- Sign users out using resy_sign_out (MUST use the tool — never fake it)
 - Provide recommendations based on cuisine, location, and preferences
 
 ## Resy Booking Flow
 1. Search for restaurants → get venue IDs
-2. Find available slots for a venue/date/party size → get config tokens
-3. Book using a config token (this is a real reservation — always confirm with the user first)
+2. Find available slots for a venue/date/party size → see whats open
+3. Book by venue ID + date + time + party size (always confirm with the user first — this is a REAL reservation)
 4. Cancel using a resy_token from an existing reservation
+
+When a booking is confirmed, ALWAYS send the venue_url from the confirmation as a separate message so the user can tap it. Example: "heres your reservation link" then "---" then the URL.
 
 ## Conversation Awareness
 You have full access to the conversation history. USE IT:
@@ -327,10 +342,28 @@ const RESY_RESERVATIONS_TOOL: Anthropic.Tool = {
   },
 };
 
+const RESY_PROFILE_TOOL: Anthropic.Tool = {
+  name: 'resy_profile',
+  description: 'Get the user\'s Resy profile info — name, email, phone, booking count, etc. Use when they ask about their account, "what\'s my name", or you need their details.',
+  input_schema: {
+    type: 'object' as const,
+    properties: {},
+  },
+};
+
+const RESY_SIGN_OUT_TOOL: Anthropic.Tool = {
+  name: 'resy_sign_out',
+  description: 'Disconnect the user\'s Resy account. Use when they want to sign out, log out, disconnect, or reset their Resy connection. After calling this, tell them to text again to reconnect.',
+  input_schema: {
+    type: 'object' as const,
+    properties: {},
+  },
+};
+
 // Tools that return data Claude needs to reason about (require tool-use loop)
 const DATA_RETRIEVAL_TOOLS = new Set([
   'resy_search', 'resy_find_slots', 'resy_reservations',
-  'resy_book', 'resy_cancel',
+  'resy_book', 'resy_cancel', 'resy_sign_out', 'resy_profile',
 ]);
 
 const MAX_TOOL_LOOPS = 5;
@@ -462,6 +495,8 @@ export async function chat(chatId: string, userMessage: string, images: ImageInp
         RESY_SEARCH_TOOL, RESY_FIND_SLOTS_TOOL,
         RESY_BOOK_TOOL, RESY_CANCEL_TOOL,
         RESY_RESERVATIONS_TOOL,
+        RESY_PROFILE_TOOL,
+        RESY_SIGN_OUT_TOOL,
       );
     }
     if (chatContext?.isGroupChat) {
@@ -549,6 +584,25 @@ export async function chat(chatId: string, userMessage: string, images: ImageInp
             const msg = error instanceof Error ? error.message : 'Unknown error';
             console.error('[claude] resy_reservations error:', msg);
             toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Error fetching reservations: ${msg}`, is_error: true });
+          }
+
+        } else if (block.name === 'resy_profile') {
+          try {
+            const profile = await getResyProfile(resyAuthToken!);
+            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(profile) });
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : 'Unknown error';
+            console.error('[claude] resy_profile error:', msg);
+            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Error fetching profile: ${msg}`, is_error: true });
+          }
+
+        } else if (block.name === 'resy_sign_out') {
+          if (chatContext?.senderHandle) {
+            await clearCredentials(chatContext.senderHandle);
+            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Signed out successfully. Credentials removed.' });
+            console.log(`[claude] User signed out via tool call`);
+          } else {
+            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Could not determine user identity.', is_error: true });
           }
 
         } else {
@@ -654,6 +708,10 @@ export async function chat(chatId: string, userMessage: string, images: ImageInp
         toolSummaryParts.push(`[cancelled a reservation]`);
       } else if (block.name === 'resy_reservations') {
         toolSummaryParts.push(`[checked upcoming reservations]`);
+      } else if (block.name === 'resy_profile') {
+        toolSummaryParts.push(`[checked resy profile]`);
+      } else if (block.name === 'resy_sign_out') {
+        toolSummaryParts.push(`[signed out of resy]`);
       }
     }
 

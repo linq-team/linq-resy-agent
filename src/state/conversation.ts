@@ -1,7 +1,9 @@
-// In-memory conversation and user profile storage
-// Conversations expire after 24 hours. User profiles persist until process restarts.
+// Conversation and user profile storage backed by DynamoDB.
+// Conversations expire after 24 hours (via DynamoDB TTL). User profiles persist.
 
-const CONVERSATION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+import { getItem, putItem, deleteItem } from '../db/dynamodb.js';
+
+const CONVERSATION_TTL_S = 24 * 60 * 60; // 24 hours
 const MAX_MESSAGES = 50;
 
 export interface StoredMessage {
@@ -23,55 +25,48 @@ export interface UserProfile {
   lastSeen: number;
 }
 
-const conversations = new Map<string, ConversationRecord>();
-const userProfiles = new Map<string, UserProfile>();
-
-// Clean up expired conversations periodically
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, record] of conversations) {
-    if (now - record.lastActive > CONVERSATION_TTL_MS) {
-      conversations.delete(key);
-    }
-  }
-}, 5 * 60 * 1000); // Every 5 minutes
+// ── Conversations ──────────────────────────────────────────────────────────
 
 export async function getConversation(chatId: string): Promise<StoredMessage[]> {
-  const record = conversations.get(chatId);
+  const record = await getItem<ConversationRecord>(`CONV#${chatId}`, 'CONV');
   if (!record) return [];
-  if (Date.now() - record.lastActive > CONVERSATION_TTL_MS) {
-    conversations.delete(chatId);
-    return [];
-  }
-  return [...record.messages];
+  return record.messages ?? [];
 }
 
 export async function addMessage(chatId: string, role: 'user' | 'assistant', content: string, handle?: string): Promise<void> {
-  const record = conversations.get(chatId) || { messages: [], lastActive: Date.now() };
+  const record = await getItem<ConversationRecord>(`CONV#${chatId}`, 'CONV');
+  const messages = record?.messages ?? [];
   const msg: StoredMessage = { role, content };
   if (handle) msg.handle = handle;
-  record.messages.push(msg);
-  record.messages = record.messages.slice(-MAX_MESSAGES);
-  record.lastActive = Date.now();
-  conversations.set(chatId, record);
+  messages.push(msg);
+  const trimmed = messages.slice(-MAX_MESSAGES);
+
+  await putItem(`CONV#${chatId}`, 'CONV', {
+    messages: trimmed,
+    lastActive: Date.now(),
+  }, CONVERSATION_TTL_S);
 }
 
 export async function clearConversation(chatId: string): Promise<void> {
-  conversations.delete(chatId);
+  await deleteItem(`CONV#${chatId}`, 'CONV');
 }
 
 export async function clearAllConversations(): Promise<void> {
-  conversations.clear();
+  // In DynamoDB, this would require a scan+delete which is expensive.
+  // For the Lambda architecture, individual conversations expire via TTL.
+  // This is only used by dev /clear-all — log a warning.
+  console.warn('[state] clearAllConversations is a no-op in DynamoDB mode');
 }
 
 // ── User Profiles ───────────────────────────────────────────────────────────
 
 export async function getUserProfile(handle: string): Promise<UserProfile | null> {
-  return userProfiles.get(handle) || null;
+  const record = await getItem<UserProfile>(`USERPROFILE#${handle}`, 'USERPROFILE');
+  return record ?? null;
 }
 
 export async function updateUserProfile(handle: string, updates: { name?: string; facts?: string[] }): Promise<void> {
-  const existing = userProfiles.get(handle);
+  const existing = await getUserProfile(handle);
   const now = Math.floor(Date.now() / 1000);
   const profile: UserProfile = {
     handle,
@@ -80,12 +75,12 @@ export async function updateUserProfile(handle: string, updates: { name?: string
     firstSeen: existing?.firstSeen ?? now,
     lastSeen: now,
   };
-  userProfiles.set(handle, profile);
+  await putItem(`USERPROFILE#${handle}`, 'USERPROFILE', profile as unknown as Record<string, unknown>);
   console.log(`[state] Updated profile for ${handle}: name=${profile.name}, facts=${profile.facts.length}`);
 }
 
 export async function addUserFact(handle: string, fact: string): Promise<boolean> {
-  const existing = userProfiles.get(handle);
+  const existing = await getUserProfile(handle);
   const facts = existing?.facts ? [...existing.facts] : [];
   if (facts.includes(fact)) return false;
   facts.push(fact);
@@ -94,14 +89,16 @@ export async function addUserFact(handle: string, fact: string): Promise<boolean
 }
 
 export async function setUserName(handle: string, name: string): Promise<boolean> {
-  const existing = userProfiles.get(handle);
+  const existing = await getUserProfile(handle);
   if (existing?.name === name) return false;
   await updateUserProfile(handle, { name });
   return true;
 }
 
 export async function clearUserProfile(handle: string): Promise<boolean> {
-  userProfiles.delete(handle);
+  await deleteItem(`USERPROFILE#${handle}`, 'USERPROFILE');
   console.log(`[state] Cleared profile for ${handle}`);
   return true;
 }
+
+// No cleanup intervals needed — DynamoDB TTL handles conversation expiry.

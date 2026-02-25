@@ -25,6 +25,7 @@ export interface ResyBookingConfirmation {
   resy_token: string;  // rr://... format — needed for cancellation
   reservation_id: number;
   venue_name: string;
+  venue_url: string;   // e.g., https://resy.com/cities/new-york-ny/carbone
   date: string;
   time: string;
   party_size: number;

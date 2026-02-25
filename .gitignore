@@ -13,5 +13,10 @@ CLAUDE.md
 .claude/
 .codex/
 
+# AWS / SAM deployment state (contains account IDs, phone numbers)
+infra/samconfig.toml
+infra/.aws-sam/
+.aws/
+
 # OpenAPI spec (get latest from https://apidocs.linqapp.com)
 linqV3api.yaml

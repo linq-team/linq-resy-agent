@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import type { Request, Response, NextFunction } from 'express';
+import type { Request, Response } from 'express';
 import { verifyAuthToken, getAuthTokenChatId } from './db.js';
 import { verifyMagicLinkToken } from './magicLink.js';
 import { setCredentials, createUser, getUser } from './db.js';
@@ -8,15 +8,18 @@ import { redactPhone } from '../utils/redact.js';
 
 export const authRoutes = Router();
 
-// ── Rate Limiting ──────────────────────────────────────────────────────────
-
+// Rate limiting is handled by API Gateway throttling in Lambda mode.
+// For local Express dev, we keep a simple in-memory guard.
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
-const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
-const RATE_LIMIT_MAX_SUBMIT = 5;     // 5 attempts per minute per IP
-const RATE_LIMIT_MAX_PAGE = 15;      // 15 page loads per minute per IP
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_SUBMIT = 5;
+const RATE_LIMIT_MAX_PAGE = 15;
 
 function rateLimit(max: number) {
-  return (req: Request, res: Response, next: NextFunction) => {
+  return (req: Request, res: Response, next: () => void) => {
+    // Skip rate limiting inside Lambda (API Gateway handles it)
+    if (process.env.AWS_LAMBDA_FUNCTION_NAME) { next(); return; }
+
     const ip = req.ip || req.socket.remoteAddress || 'unknown';
     const key = `${ip}:${req.path}`;
     const now = Date.now();
@@ -39,14 +42,6 @@ function rateLimit(max: number) {
   };
 }
 
-// Clean up rate limit map every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of rateLimitMap) {
-    if (now > entry.resetAt) rateLimitMap.delete(key);
-  }
-}, 5 * 60_000);
-
 // ── Input Validation ───────────────────────────────────────────────────────
 
 function isValidApiKey(key: string): boolean {
@@ -65,8 +60,8 @@ function setPageSecurityHeaders(res: Response): void {
     "default-src 'none'",
     "script-src 'unsafe-inline'",
     "style-src 'unsafe-inline'",
-    "img-src 'self'",
-    "font-src 'self'",
+    "img-src 'self' data:",
+    "font-src 'self' data:",
     "connect-src 'self'",
     "frame-ancestors 'none'",
   ].join('; '));
@@ -78,7 +73,7 @@ function setPageSecurityHeaders(res: Response): void {
  * GET /auth/setup?token={token}
  * Verify the magic link token and serve the onboarding page.
  */
-authRoutes.get('/auth/setup', rateLimit(RATE_LIMIT_MAX_PAGE), (req: Request, res: Response) => {
+authRoutes.get('/auth/setup', rateLimit(RATE_LIMIT_MAX_PAGE), async (req: Request, res: Response) => {
   const token = req.query.token as string;
   if (!token) {
     setPageSecurityHeaders(res);
@@ -86,7 +81,7 @@ authRoutes.get('/auth/setup', rateLimit(RATE_LIMIT_MAX_PAGE), (req: Request, res
     return;
   }
 
-  const phoneNumber = verifyAuthToken(token);
+  const phoneNumber = await verifyAuthToken(token);
   if (!phoneNumber) {
     setPageSecurityHeaders(res);
     res.status(400).send(errorPage('Link expired', 'This link has expired or already been used. Text the agent to get a new one.'));
@@ -126,9 +121,9 @@ authRoutes.post('/auth/setup/submit', rateLimit(RATE_LIMIT_MAX_SUBMIT), async (r
     return;
   }
 
-  const chatId = getAuthTokenChatId(token);
+  const chatId = await getAuthTokenChatId(token);
 
-  const phoneNumber = verifyMagicLinkToken(token);
+  const phoneNumber = await verifyMagicLinkToken(token);
   if (!phoneNumber) {
     res.status(400).json({ error: 'Invalid or expired token. Text the agent for a new link.' });
     return;
@@ -137,12 +132,12 @@ authRoutes.post('/auth/setup/submit', rateLimit(RATE_LIMIT_MAX_SUBMIT), async (r
   const trimmedToken = resyAuthToken.trim();
 
   // Ensure user exists
-  if (!getUser(phoneNumber)) {
-    createUser(phoneNumber);
+  if (!(await getUser(phoneNumber))) {
+    await createUser(phoneNumber);
   }
 
   // Store encrypted credentials
-  setCredentials(phoneNumber, { resyAuthToken: trimmedToken });
+  await setCredentials(phoneNumber, { resyAuthToken: trimmedToken });
 
   console.log(`[auth] Credentials saved for ${redactPhone(phoneNumber)}`);
   res.json({ success: true });
@@ -169,7 +164,6 @@ function errorPage(title: string, message: string): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Bookings — ${title}</title>
-  <link rel="icon" href="/favicon.ico">
   <style>${baseStyles()}
     .error-wrap { text-align: center; padding: 60px 28px; }
     .error-wrap h1 { font-size: 24px; margin-bottom: 12px; }
@@ -197,7 +191,6 @@ function onboardingPage(token: string): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Bookings — Connect Resy</title>
-  <link rel="icon" href="/favicon.ico">
   <meta property="og:title" content="Connect your Resy account">
   <meta property="og:description" content="Tap to link your Resy account — takes 30 seconds">
   <meta property="og:type" content="website">
@@ -221,7 +214,7 @@ function onboardingPage(token: string): string {
       padding: 16px; background: #c8ff00; color: #0a0a0a; border: none;
       border-radius: 100px; font-size: 15px; font-weight: 600; cursor: pointer;
       transition: background 0.2s, transform 0.1s; margin-top: 4px;
-      font-family: 'FK Display', system-ui, sans-serif;
+      font-family: system-ui, -apple-system, sans-serif;
     }
     button[type="submit"]:hover { background: #b8ef00; }
     button[type="submit"]:active { transform: scale(0.98); }
@@ -318,7 +311,7 @@ function headerHTML(): string {
   return `
     <div class="header-bar">
       <div class="logo-row">
-        <img src="/images/linq-header-white.png" alt="Linq" class="linq-wordmark">
+        <span class="linq-wordmark">Linq</span>
       </div>
     </div>`;
 }
@@ -332,14 +325,9 @@ function footerHTML(): string {
 
 function baseStyles(): string {
   return `
-    @font-face {
-      font-family: 'FK Display';
-      src: url('/fonts/FKDisplay-Regular.ttf') format('truetype');
-      font-weight: 400; font-style: normal; font-display: swap;
-    }
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: 'FK Display', system-ui, -apple-system, sans-serif;
+      font-family: system-ui, -apple-system, sans-serif;
       background: #0a0a0a; color: #ffffff; min-height: 100vh;
       display: flex; justify-content: center; align-items: flex-start;
       padding: 0 20px; -webkit-font-smoothing: antialiased;
@@ -350,7 +338,7 @@ function baseStyles(): string {
       padding: 28px 0; border-bottom: 1px solid #222222; margin-bottom: 36px;
     }
     .logo-row { display: flex; align-items: center; gap: 14px; }
-    .linq-wordmark { height: 30px; width: auto; }
+    .linq-wordmark { font-size: 24px; font-weight: 600; letter-spacing: -0.5px; }
     .card {
       background: #111111; border: 1px solid #222222;
       border-radius: 16px; overflow: hidden;

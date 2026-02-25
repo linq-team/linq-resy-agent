@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Linq Bookings Agent — Lambda + DynamoDB + SQS
+
+# ── Parameters (secrets passed at deploy time, never in code) ──────────
+
+Parameters:
+  LinqApiToken:
+    Type: String
+    NoEcho: true
+    Description: Linq Blue API bearer token
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Description: Claude API key
+  CredentialEncryptionKey:
+    Type: String
+    NoEcho: true
+    Description: 64-char hex key for AES-256-GCM credential encryption
+  ResyApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Resy API key (optional — defaults to embedded public key)
+  LinqAgentBotNumbers:
+    Type: String
+    Default: ''
+    Description: Comma-separated bot phone numbers (optional)
+  AllowedSenders:
+    Type: String
+    Default: ''
+    Description: Comma-separated allowed sender numbers (dev only)
+  IgnoredSenders:
+    Type: String
+    Default: ''
+    Description: Comma-separated ignored sender numbers
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures: [arm64]
+    MemorySize: 256
+    Layers:
+      - !Ref AnthropicSdkLayer
+    Environment:
+      Variables:
+        NODE_ENV: production
+        DYNAMODB_TABLE: !Ref BookingsTable
+        LINQ_API_TOKEN: !Ref LinqApiToken
+        ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+        CREDENTIAL_ENCRYPTION_KEY: !Ref CredentialEncryptionKey
+        RESY_API_KEY: !Ref ResyApiKey
+        LINQ_AGENT_BOT_NUMBERS: !Ref LinqAgentBotNumbers
+        ALLOWED_SENDERS: !Ref AllowedSenders
+        IGNORED_SENDERS: !Ref IgnoredSenders
+  HttpApi:
+    CorsConfiguration:
+      AllowOrigins:
+        - '*'
+      AllowMethods:
+        - GET
+        - POST
+      AllowHeaders:
+        - Content-Type
+
+Resources:
+
+  # ── Lambda Layer (Anthropic SDK — too large to bundle inline) ────────
+
+  AnthropicSdkLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: anthropic-sdk
+      Description: '@anthropic-ai/sdk npm package'
+      ContentUri: ../dist/layer
+      CompatibleRuntimes:
+        - nodejs20.x
+      CompatibleArchitectures:
+        - arm64
+        - x86_64
+
+  # ── DynamoDB Table (single-table design) ─────────────────────────────
+
+  BookingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: bookings-agent
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+
+  # ── SQS Queue (FIFO for per-chat ordering) ──────────────────────────
+
+  MessageQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: bookings-agent-messages.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 3600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 2
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: bookings-agent-dlq.fifo
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+
+  # ── Lambda #1: Receiver ─────────────────────────────────────────────
+
+  ReceiverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: bookings-agent-receiver
+      Handler: receiver.handler
+      CodeUri: ../dist/handlers
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref MessageQueue
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt MessageQueue.QueueName
+      Events:
+        CatchAll:
+          Type: HttpApi
+
+  # ── Lambda #2: Processor ────────────────────────────────────────────
+
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: bookings-agent-processor
+      Handler: processor.handler
+      CodeUri: ../dist/handlers
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          BASE_URL: !Sub 'https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BookingsTable
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MessageQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway URL (use as Linq webhook URL)
+    Value: !Sub 'https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  ReceiverFunctionArn:
+    Value: !GetAtt ReceiverFunction.Arn
+  ProcessorFunctionArn:
+    Value: !GetAtt ProcessorFunction.Arn
+  TableName:
+    Value: !Ref BookingsTable
+  QueueUrl:
+    Value: !Ref MessageQueue
