@@ -70,9 +70,10 @@ async function processRecord(record: SQSRecord): Promise<void> {
   const { chat_id: chatId, from, message, service } = webhookEvent.data;
   const messageId = message.id;
 
-  const text = extractTextContent(message.parts);
-  const images = extractImageUrls(message.parts);
-  const audio = extractAudioUrls(message.parts);
+  const parts = message.parts ?? [];
+  const text = extractTextContent(parts);
+  const images = extractImageUrls(parts);
+  const audio = extractAudioUrls(parts);
   const incomingEffect = message.effect;
   const incomingReplyTo = message.reply_to;
 

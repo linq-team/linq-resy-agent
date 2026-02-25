@@ -15,15 +15,16 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import {
   isMessageReceivedEvent,
+  isLocationSharingStartedEvent,
   extractTextContent,
   extractImageUrls,
   extractAudioUrls,
 } from '../webhook/types.js';
-import type { WebhookEvent } from '../webhook/types.js';
+import type { WebhookEvent, MessageReceivedEvent, LocationSharingStartedEvent } from '../webhook/types.js';
 import { verifyAuthToken, getAuthTokenChatId } from '../auth/db.js';
 import { verifyMagicLinkToken } from '../auth/magicLink.js';
 import { setCredentials, createUser, getUser } from '../auth/db.js';
-import { sendMessage } from '../linq/client.js';
+import { sendMessage, getLocation, getChat } from '../linq/client.js';
 import { redactPhone } from '../utils/redact.js';
 
 const sqs = new SQSClient({});
@@ -78,6 +79,11 @@ async function handleWebhook(event: APIGatewayProxyEventV2): Promise<APIGatewayP
   const pstTime = new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles', hour12: false });
   console.log(`[webhook] ${pstTime} PST | ${webhookEvent.event_type} (${webhookEvent.event_id})`);
 
+  // ── Location sharing webhook ──────────────────────────────────────────
+  if (isLocationSharingStartedEvent(webhookEvent)) {
+    return handleLocationSharing(webhookEvent);
+  }
+
   // Only process message.received events
   if (!isMessageReceivedEvent(webhookEvent)) {
     return json(200, { received: true });
@@ -103,13 +109,42 @@ async function handleWebhook(event: APIGatewayProxyEventV2): Promise<APIGatewayP
     return json(200, { received: true });
   }
 
-  const text = extractTextContent(message.parts);
-  const images = extractImageUrls(message.parts);
-  const audio = extractAudioUrls(message.parts);
+  const parts = message.parts ?? [];
+  const text = extractTextContent(parts);
+  const images = extractImageUrls(parts);
+  const audio = extractAudioUrls(parts);
 
-  if (!text.trim() && images.length === 0 && audio.length === 0) {
-    console.log(`[webhook] Skipping empty message`);
-    return json(200, { received: true });
+  // Location shares arrive as message.received with a garbled/non-printable text character
+  // Detect: empty text, or very short non-ASCII text (the "garbled character" artifact)
+  const trimmed = text.trim();
+  const isLikelyLocationShare = trimmed.length === 0
+    || (trimmed.length <= 2 && /[^\x20-\x7E]/.test(trimmed));
+
+  if (isLikelyLocationShare && images.length === 0 && audio.length === 0) {
+    console.log(`[webhook] Possible location share — text bytes: [${[...Buffer.from(text)].map(b => '0x' + b.toString(16)).join(', ')}]`);
+    try {
+      const location = await getLocation(chat_id);
+      if (location) {
+        const locality = location.locality || location.address || '';
+        const locationDesc = locality
+          ? `${location.lat}, ${location.lng} — ${locality}`
+          : `${location.lat}, ${location.lng}`;
+        console.log(`[webhook] Detected location share from ${redactPhone(from)}: ${locationDesc}`);
+
+        // Rewrite the event with a text part so the processor can handle it
+        webhookEvent.data.message.parts = [{ type: 'text', value: `[user shared their location: ${locationDesc}]` }];
+        // Use a stable dedup ID — Linq fires multiple webhook events for one location share
+        // Round to 30s window so only the first one gets enqueued
+        const dedupBucket = Math.floor(Date.now() / 30000);
+        webhookEvent.event_id = `loc-${chat_id}-${dedupBucket}`;
+      } else {
+        console.log(`[webhook] Skipping empty message (no text, media, or location)`);
+        return json(200, { received: true });
+      }
+    } catch (error) {
+      console.log(`[webhook] Skipping empty message`);
+      return json(200, { received: true });
+    }
   }
 
   // Enqueue the validated message for async processing
@@ -122,6 +157,103 @@ async function handleWebhook(event: APIGatewayProxyEventV2): Promise<APIGatewayP
 
   console.log(`[webhook] Enqueued message from ${redactPhone(from)} for processing`);
   return json(200, { received: true });
+}
+
+// ── Location sharing handler ─────────────────────────────────────────────
+
+async function handleLocationSharing(webhookEvent: LocationSharingStartedEvent): Promise<APIGatewayProxyResultV2> {
+  const { shared_by, shared_with } = webhookEvent.data;
+  console.log(`[webhook] Location sharing started: ${redactPhone(shared_by)} → ${redactPhone(shared_with)}`);
+
+  // shared_with is our bot number — apply same filter as message.received
+  if (botNumbers.length > 0 && !botNumbers.includes(shared_with)) {
+    console.log(`[webhook] Skipping location sharing to ${redactPhone(shared_with)} (not this bot's number)`);
+    return json(200, { received: true });
+  }
+
+  try {
+    // Webhook doesn't include chat_id — look it up from the two handles
+    const chatId = await findChatByHandles(shared_by, shared_with);
+    if (!chatId) {
+      console.error(`[webhook] Could not find chat for location sharing between ${redactPhone(shared_by)} and ${redactPhone(shared_with)}`);
+      return json(200, { received: true });
+    }
+
+    const location = await getLocation(chatId);
+    if (!location) {
+      console.log(`[webhook] Location not available yet for chat ${chatId}`);
+      return json(200, { received: true });
+    }
+
+    const locality = location.locality || location.address || '';
+    const locationDesc = locality
+      ? `${location.lat}, ${location.lng} — ${locality}`
+      : `${location.lat}, ${location.lng}`;
+
+    // Build a synthetic message.received event so the processor handles it normally
+    const syntheticEvent: MessageReceivedEvent = {
+      api_version: 'v3',
+      event_id: `loc-${Date.now()}`,
+      created_at: new Date().toISOString(),
+      trace_id: `loc-${Date.now()}`,
+      partner_id: webhookEvent.partner_id,
+      event_type: 'message.received',
+      data: {
+        chat_id: chatId,
+        from: shared_by,
+        recipient_phone: shared_with,
+        received_at: new Date().toISOString(),
+        is_from_me: false,
+        service: 'iMessage',
+        message: {
+          id: `loc-msg-${Date.now()}`,
+          parts: [{ type: 'text', value: `[user shared their location: ${locationDesc}]` }],
+        },
+      },
+    };
+
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: QUEUE_URL,
+      MessageBody: JSON.stringify(syntheticEvent),
+      MessageGroupId: chatId,
+      MessageDeduplicationId: syntheticEvent.event_id,
+    }));
+
+    console.log(`[webhook] Enqueued synthetic location message for chat ${chatId}: ${locationDesc}`);
+  } catch (error) {
+    console.error(`[webhook] Error handling location sharing:`, error);
+  }
+
+  return json(200, { received: true });
+}
+
+async function findChatByHandles(userHandle: string, botHandle: string): Promise<string | null> {
+  const API_TOKEN = process.env.LINQ_API_TOKEN;
+  const BASE_URL = process.env.LINQ_API_BASE_URL || 'https://api.linqapp.com/api/partner/v3';
+
+  if (!API_TOKEN) return null;
+
+  try {
+    const response = await fetch(`${BASE_URL}/chats?handle=${encodeURIComponent(userHandle)}`, {
+      headers: { 'Authorization': `Bearer ${API_TOKEN}` },
+    });
+
+    if (!response.ok) return null;
+
+    const chats = await response.json() as Array<{ id: string; handles: Array<{ handle: string }> }>;
+
+    // Find the chat that includes both the user and bot handles
+    for (const chat of chats) {
+      const handles = chat.handles.map(h => h.handle);
+      if (handles.includes(userHandle) && handles.includes(botHandle)) {
+        return chat.id;
+      }
+    }
+  } catch (error) {
+    console.error(`[webhook] Error finding chat by handles:`, error);
+  }
+
+  return null;
 }
 
 // ── Auth setup page ─────────────────────────────────────────────────────

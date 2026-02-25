@@ -59,8 +59,24 @@ export interface ReplyTo {
   part_index?: number;
 }
 
+export interface LocationSharingStartedEvent extends WebhookEvent {
+  event_type: 'location.sharing.started';
+  data: LocationSharingStartedData;
+}
+
+export interface LocationSharingStartedData {
+  shared_by: string;
+  shared_with: string;
+  began_at?: string;
+  ends_at?: string;
+}
+
 export function isMessageReceivedEvent(event: WebhookEvent): event is MessageReceivedEvent {
   return event.event_type === 'message.received';
+}
+
+export function isLocationSharingStartedEvent(event: WebhookEvent): event is LocationSharingStartedEvent {
+  return event.event_type === 'location.sharing.started';
 }
 
 export function extractTextContent(parts: MessagePart[]): string {
