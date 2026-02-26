@@ -303,6 +303,105 @@ export async function stopTyping(chatId: string): Promise<void> {
   console.log(`[linq] Typing indicator stopped`);
 }
 
+// ── Location Sharing ─────────────────────────────────────────────────────
+
+export interface UserLocation {
+  lat: number;
+  lng: number;
+  address?: string;
+  locality?: string;
+}
+
+export async function requestLocationSharing(chatId: string): Promise<boolean> {
+  if (!API_TOKEN) {
+    throw new Error('LINQ_API_TOKEN not configured');
+  }
+
+  const url = `${BASE_URL}/chats/${chatId}/location/request`;
+
+  console.log(`[linq] Requesting location sharing for chat ${chatId}`);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${API_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`[linq] API error ${response.status}: ${truncateError(errorText)}`);
+    return false;
+  }
+
+  console.log(`[linq] Location sharing requested`);
+  return true;
+}
+
+export async function getLocation(chatId: string): Promise<UserLocation | null> {
+  if (!API_TOKEN) {
+    throw new Error('LINQ_API_TOKEN not configured');
+  }
+
+  const url = `${BASE_URL}/chats/${chatId}/location`;
+
+  console.log(`[linq] Fetching location for chat ${chatId}`);
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${API_TOKEN}`,
+    },
+  });
+
+  if (!response.ok) {
+    if (response.status === 404) {
+      console.log(`[linq] No active location sharing for chat ${chatId}`);
+      return null;
+    }
+    const errorText = await response.text();
+    console.error(`[linq] API error ${response.status}: ${truncateError(errorText)}`);
+    return null;
+  }
+
+  // Response: { success, data: { type: "FeatureCollection", features: [{ geometry, properties }] } }
+  const body = await response.json() as {
+    success: boolean;
+    data?: {
+      type: string;
+      features: Array<{
+        type: string;
+        geometry: { type: string; coordinates: number[] };
+        properties: { handle?: string; address?: string; locality?: string; updated_at?: string };
+      }>;
+    };
+  };
+
+  const feature = body.data?.features?.[0];
+  if (!feature) {
+    console.log(`[linq] No location features available for chat ${chatId}`);
+    return null;
+  }
+
+  // GeoJSON coordinates are [longitude, latitude]
+  const coords = feature.geometry?.coordinates;
+  if (!coords || coords.length < 2) {
+    console.log(`[linq] Location feature missing coordinates`);
+    return null;
+  }
+
+  const location: UserLocation = {
+    lat: coords[1],
+    lng: coords[0],
+    address: feature.properties?.address,
+    locality: feature.properties?.locality,
+  };
+
+  console.log(`[linq] Got location: ${location.lat}, ${location.lng}${location.locality ? ` (${location.locality})` : ''}`);
+  return location;
+}
+
 export type StandardReactionType = 'love' | 'like' | 'dislike' | 'laugh' | 'emphasize' | 'question';
 export type ReactionType = StandardReactionType | 'custom';
 

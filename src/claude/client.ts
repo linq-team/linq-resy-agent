@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { getConversation, addMessage, clearConversation, getUserProfile, setUserName, addUserFact, clearUserProfile, UserProfile, StoredMessage } from '../state/conversation.js';
 import { searchRestaurants, findSlots, bookReservation, getReservations, cancelReservation, getResyProfile } from '../bookings/index.js';
+import { getLocation, requestLocationSharing } from '../linq/client.js';
 import type { BookingsCredentials } from '../auth/types.js';
 import { clearCredentials, clearSignedOut as clearSignedOutFlag } from '../auth/index.js';
 
@@ -70,6 +71,15 @@ Guidelines:
 
 ## Web Search
 Use web search proactively when users ask about restaurants — look up reviews, menus, hours, etc.
+
+## Location
+- Users can share their real-time location via iMessage. When they do, you'll receive a message like "[user shared their location: LAT, LNG — LOCALITY]"
+- When you see a location share message, ALWAYS respond with text acknowledging it (e.g. "got your location! searching near [locality]") and ask what kind of food they want, or use it in your next resy_search
+- You can also check if a user is currently sharing with get_user_location
+- If someone wants nearby restaurants and you dont have their location, use request_location to send them an iMessage prompt to share
+- When you have coordinates, ALWAYS pass lat/lng to resy_search and resy_find_slots for nearby results
+- For hyperlocal results, include the neighborhood name in your search query along with lat/lng (e.g. query "italian nolita" with their coordinates)
+- NEVER react with "?" to a location share — always respond with text
 
 ## Reactions
 React to messages sparingly — text responses are always preferred. Use reactions only as supplements.
@@ -360,10 +370,31 @@ const RESY_SIGN_OUT_TOOL: Anthropic.Tool = {
   },
 };
 
+// ─── Location Tools ──────────────────────────────────────────────────────
+
+const GET_USER_LOCATION_TOOL: Anthropic.Tool = {
+  name: 'get_user_location',
+  description: 'Check if the user is sharing their location. Returns lat/lng coordinates and address if active, or a message saying they are not sharing. Use the coordinates in resy_search and resy_find_slots for nearby results.',
+  input_schema: {
+    type: 'object' as const,
+    properties: {},
+  },
+};
+
+const REQUEST_LOCATION_TOOL: Anthropic.Tool = {
+  name: 'request_location',
+  description: 'Send the user an iMessage prompt asking them to share their location. Use when they want nearby restaurants but are not currently sharing their location.',
+  input_schema: {
+    type: 'object' as const,
+    properties: {},
+  },
+};
+
 // Tools that return data Claude needs to reason about (require tool-use loop)
 const DATA_RETRIEVAL_TOOLS = new Set([
   'resy_search', 'resy_find_slots', 'resy_reservations',
   'resy_book', 'resy_cancel', 'resy_sign_out', 'resy_profile',
+  'get_user_location', 'request_location',
 ]);
 
 const MAX_TOOL_LOOPS = 5;
@@ -489,6 +520,7 @@ export async function chat(chatId: string, userMessage: string, images: ImageInp
     // Build tools list
     const tools: Anthropic.Tool[] = [
       REACTION_TOOL, EFFECT_TOOL, REMEMBER_USER_TOOL, WEB_SEARCH_TOOL,
+      GET_USER_LOCATION_TOOL, REQUEST_LOCATION_TOOL,
     ];
     if (resyAuthToken) {
       tools.push(
@@ -605,6 +637,35 @@ export async function chat(chatId: string, userMessage: string, images: ImageInp
             toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Could not determine user identity.', is_error: true });
           }
 
+        // ── Location tools ───────────────────────────────────────────
+        } else if (block.name === 'get_user_location') {
+          try {
+            const location = await getLocation(chatId);
+            if (location) {
+              toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(location) });
+            } else {
+              toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'User is not currently sharing their location.' });
+            }
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : 'Unknown error';
+            console.error('[claude] get_user_location error:', msg);
+            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Error fetching location: ${msg}`, is_error: true });
+          }
+
+        } else if (block.name === 'request_location') {
+          try {
+            const sent = await requestLocationSharing(chatId);
+            if (sent) {
+              toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Location sharing request sent. The user will see an iMessage prompt to share their location.' });
+            } else {
+              toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Failed to send location sharing request.', is_error: true });
+            }
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : 'Unknown error';
+            console.error('[claude] request_location error:', msg);
+            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Error requesting location: ${msg}`, is_error: true });
+          }
+
         } else {
           // Fire-and-forget tools
           toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'ok' });
@@ -712,6 +773,10 @@ export async function chat(chatId: string, userMessage: string, images: ImageInp
         toolSummaryParts.push(`[checked resy profile]`);
       } else if (block.name === 'resy_sign_out') {
         toolSummaryParts.push(`[signed out of resy]`);
+      } else if (block.name === 'get_user_location') {
+        toolSummaryParts.push(`[checked user location]`);
+      } else if (block.name === 'request_location') {
+        toolSummaryParts.push(`[requested location sharing]`);
       }
     }
 
